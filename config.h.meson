@@ -5,4 +5,8 @@
 
 #mesondefine HAVE_LIBSYSTEMD
 
+#mesondefine HAVE_CASPER
+
+#mesondefine HAVE_CASPER_SYSCTL
+
 #endif

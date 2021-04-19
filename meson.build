@@ -16,7 +16,9 @@ sh = find_program('sh')
 xxd = find_program('xxd')
 
 dbus_dep = dependency('dbus-1')
-libcap_dep = dependency('libcap')
+libcap_dep = dependency('libcap', required: build_machine.system() == 'linux')
+libcasper_dep = cc.find_library('libcasper')
+libcasper_sysctl_dep = cc.find_library('libcap_sysctl')
 libsystemd_dep = dependency('libsystemd', required: get_option('libsystemd'))
 polkit_dep = dependency('polkit-gobject-1', required: false)
 systemd_dep = dependency('systemd', required: false)
@@ -73,6 +75,8 @@ config = configuration_data()
 config.set('LIBEXECDIR', get_option('prefix') / libexecdir)
 config.set_quoted('PACKAGE_VERSION', meson.project_version())
 config.set('HAVE_LIBSYSTEMD', libsystemd_dep.found())
+config.set('HAVE_CASPER', libcasper_dep.found())
+config.set('HAVE_CASPER_SYSCTL', libcasper_sysctl_dep.found())
 
 config_h = configure_file(
         input: 'config.h.meson',
@@ -95,6 +99,8 @@ executable(
         dependencies: [
                 dbus_dep,
                 libcap_dep,
+                libcasper_dep,
+                libcasper_sysctl_dep,
                 librt_dep,
                 libsystemd_dep,
                 thread_dep

@@ -38,8 +38,22 @@
 #include <inttypes.h>
 #include <dbus/dbus.h>
 #include <pwd.h>
+#ifdef __linux__
 #include <sys/capability.h>
 #include <sys/prctl.h>
+#elif defined(__FreeBSD__)
+#if defined(HAVE_CASPER) && defined(HAVE_CASPER_SYSCTL)
+#define WITH_CASPER
+#endif
+#define thread system_thread
+#include <sys/user.h>
+#undef thread
+#include <sys/sysctl.h>
+#include <sys/rtprio.h>
+#include <sys/capsicum.h>
+#include <libcasper.h>
+#include <casper/cap_sysctl.h>
+#endif
 #include <time.h>
 #include <assert.h>
 #include <getopt.h>
@@ -57,13 +71,17 @@
 
 #include "rtkit.h"
 
-#ifndef __linux__
-#error "This stuff only works on Linux!"
+#if !defined(__linux__) && !defined(__FreeBSD__)
+#error "This stuff only works on Linux and FreeBSD!"
 #endif
 
 #ifndef SCHED_RESET_ON_FORK
 /* "Your libc lacks the definition of SCHED_RESET_ON_FORK. We'll now define it ourselves, however make sure your kernel is new enough! */
+#ifdef __linux__
 #define SCHED_RESET_ON_FORK 0x40000000
+#else
+#define SCHED_RESET_ON_FORK 0
+#endif
 #endif
 
 #ifndef RLIMIT_RTTIME
@@ -140,7 +158,11 @@ static unsigned canary_cheep_msec = 5000; /* 5s */
 static unsigned canary_watchdog_msec = 10000; /* 10s */
 
 /* Watchdog realtime priority */
+#ifdef __linux__
 static unsigned canary_watchdog_realtime_priority = 99;
+#elif defined(__FreeBSD__)
+static unsigned canary_watchdog_realtime_priority = 30;
+#endif
 
 /* How long after the canary died shall we refuse further RT requests? */
 static unsigned canary_refusal_sec = 5*60;
@@ -156,6 +178,11 @@ static bool log_stderr = FALSE;
 
 /* Scheduling policy to use */
 static int sched_policy = SCHED_RR;
+
+/* FD for libcasper sysctl capability */
+#if defined(__FreeBSD__)
+static cap_channel_t *capsysctl = NULL;
+#endif
 
 struct thread {
         /* We use the thread id plus its starttime as a unique identifier for threads */
@@ -220,6 +247,7 @@ static char* get_user_name(uid_t uid, char *user, size_t len) {
 }
 
 static int read_starttime(pid_t pid, pid_t tid, unsigned long long *st) {
+#ifdef __linux__
         char fn[128], line[256], *p;
         int r;
         FILE *f;
@@ -275,6 +303,24 @@ static int read_starttime(pid_t pid, pid_t tid, unsigned long long *st) {
                 return -EIO;
 
         return 0;
+#elif defined(__FreeBSD__)
+        struct kinfo_proc p;
+        int mib[4];
+        size_t len = 4;
+
+        if (cap_sysctlnametomib(capsysctl, "kern.proc.pid", mib, &len) == -1)
+                return -EIO;
+
+        len = sizeof(struct kinfo_proc);
+        mib[3] = pid;
+
+        if (cap_sysctl(capsysctl, mib, 4, &p, &len, NULL, 0) == -1)
+                return -EIO;
+
+        *st = (unsigned long long)p.ki_start.tv_sec;
+
+        return 0;
+#endif
 }
 
 static void free_thread(struct thread *t) {
@@ -590,6 +636,7 @@ static void self_drop_realtime(int nice_level) {
 
 /* Verifies that RLIMIT_RTTIME is set for the specified process */
 static int verify_process_rttime(struct process *p) {
+#ifdef __linux__
         char fn[128];
         FILE *f;
         int r;
@@ -636,9 +683,13 @@ static int verify_process_rttime(struct process *p) {
         fclose(f);
 
         return good ? 0 : -EPERM;
+#else
+        return 0;
+#endif
 }
 
 static int verify_process_user(struct rtkit_user *u, struct process *p) {
+#ifdef __linux__
         char fn[128];
         int r;
         struct stat st;
@@ -657,6 +708,9 @@ static int verify_process_user(struct rtkit_user *u, struct process *p) {
         }
 
         return st.st_uid == u->uid ? 0 : -EPERM;
+#else
+        return 0; //TODO
+#endif
 }
 
 static int verify_process_starttime(struct process *p) {
@@ -690,30 +744,46 @@ static int verify_thread_starttime(struct process *p, struct thread *t) {
 }
 
 static int thread_reset(pid_t tid) {
+#ifdef __linux__
         struct sched_param param;
+#elif defined(__FreeBSD__)
+        struct rtprio param;
+#endif
         int r = 0;
 
         memset(&param, 0, sizeof(param));
+#ifdef __linux__
         param.sched_priority = 0;
-
-        if (sched_setscheduler(tid, SCHED_OTHER, &param) < 0) {
+        if (sched_setscheduler(tid, SCHED_OTHER, &param) < 0)
+#elif defined(__FreeBSD__)
+        param.type = RTP_PRIO_NORMAL;
+        param.prio = 0;
+        if (rtprio_thread(RTP_SET, tid, &param) < 0)
+#endif
+        {
                 if (errno != ESRCH)
                         syslog(LOG_WARNING, "Warning: Failed to reset scheduling to SCHED_OTHER for thread %llu: %s\n", (unsigned long long) tid, strerror(errno));
                 r = -1;
         }
 
+#ifdef __linux__
         if (setpriority(PRIO_PROCESS, tid, 0) < 0) {
                 if (errno != ESRCH)
                         syslog(LOG_WARNING, "Warning: Failed to reset nice level to 0 for thread %llu: %s\n", (unsigned long long) tid, strerror(errno));
                 r = -1;
         }
+#endif
 
         return r;
 }
 
 static int process_set_realtime(struct rtkit_user *u, struct process *p, struct thread *t, unsigned priority) {
         int r;
+#ifdef __linux__
         struct sched_param param;
+#elif defined(__FreeBSD__)
+        struct rtprio param;
+#endif
         char user[64];
 
         if ((int) priority < sched_get_priority_min(sched_policy) ||
@@ -747,8 +817,15 @@ static int process_set_realtime(struct rtkit_user *u, struct process *p, struct 
 
         /* Ok, everything seems to be in order, now, let's do it */
         memset(&param, 0, sizeof(param));
+#ifdef __linux__
         param.sched_priority = (int) priority;
-        if (sched_setscheduler(t->pid, sched_policy|SCHED_RESET_ON_FORK, &param) < 0) {
+        if (sched_setscheduler(t->pid, sched_policy|SCHED_RESET_ON_FORK, &param) < 0)
+#elif defined(__FreeBSD__)
+        param.type = (sched_policy == SCHED_RR) ? RTP_PRIO_REALTIME : RTP_PRIO_FIFO;
+        param.prio = RTP_PRIO_MAX - (int) priority;
+        if (rtprio_thread(RTP_SET, t->pid, &param) < 0)
+#endif
+        {
                 r = -errno;
                 syslog(LOG_ERR, "Failed to make thread %llu RT: %s\n", (unsigned long long) t->pid, strerror(errno));
                 goto finish;
@@ -815,11 +892,14 @@ static int process_set_high_priority(struct rtkit_user *u, struct process *p, st
                 goto finish;
         }
 
+#ifdef __linux__
         if (setpriority(PRIO_PROCESS, t->pid, priority) < 0) {
                 r = -errno;
                 syslog(LOG_ERR, "Failed to set nice level of process %llu to %i: %s\n", (unsigned long long) t->pid, priority, strerror(errno));
                 goto finish;
         }
+#endif
+        /* FreeBSD does not have per-thread niceness at all */
 
         if ((r = verify_thread_starttime(p, t)) < 0 ||
             (r = verify_process_starttime(p)) < 0 ||
@@ -868,6 +948,7 @@ static void reset_known(void) {
 }
 
 static int reset_all(void) {
+#ifdef __linux__
         DIR *pd;
         int r;
         unsigned n_demoted = 0;
@@ -967,6 +1048,9 @@ static int reset_all(void) {
         syslog(LOG_NOTICE, "Demoted %u threads.\n", n_demoted);
 
         return 0;
+#else
+        return -ENOTSUP;
+#endif
 }
 
 /* This mimics dbus_bus_get_unix_user() */
@@ -1698,6 +1782,7 @@ static int drop_privileges(void) {
         struct passwd *pw = NULL;
         int r;
 
+#ifdef __linux__
         if (do_drop_privileges) {
 
                 /* First, get user data */
@@ -1706,6 +1791,7 @@ static int drop_privileges(void) {
                         return -ENOENT;
                 }
         }
+#endif
 
         if (do_chroot) {
 
@@ -1722,6 +1808,7 @@ static int drop_privileges(void) {
         }
 
         if (do_drop_privileges) {
+#ifdef __linux__
                 static const cap_value_t cap_values[] = {
                         CAP_SYS_NICE,             /* Needed for obvious reasons */
                         CAP_DAC_READ_SEARCH      /* Needed so that we can verify resource limits */
@@ -1786,6 +1873,9 @@ static int drop_privileges(void) {
                 }
 
                 assert_se(cap_free(caps) == 0);
+#elif defined(__FreeBSD__)
+                cap_enter();
+#endif
 
                 /* Eigth, update environment */
                 setenv("USER", username, 1);
@@ -1808,19 +1898,23 @@ static int set_resource_limits(void) {
         } table[] = {
                 { .id = RLIMIT_FSIZE,    .name = "RLIMIT_FSIZE",    .value =  0 },
                 { .id = RLIMIT_MEMLOCK,  .name = "RLIMIT_MEMLOCK",  .value =  0 },
-                { .id = RLIMIT_MSGQUEUE, .name = "RLIMIT_MSGQUEUE", .value =  0 },
-                { .id = RLIMIT_NICE,     .name = "RLIMIT_NICE",     .value = 20 },
                 { .id = RLIMIT_NOFILE,   .name = "RLIMIT_NOFILE",   .value = 50 },
                 { .id = RLIMIT_NPROC,    .name = "RLIMIT_NPROC",    .value =  3 },
+#ifdef __linux__
+                { .id = RLIMIT_MSGQUEUE, .name = "RLIMIT_MSGQUEUE", .value =  0 },
+                { .id = RLIMIT_NICE,     .name = "RLIMIT_NICE",     .value = 20 },
                 { .id = RLIMIT_RTPRIO,   .name = "RLIMIT_RTPRIO",   .value =  0 }, /* Since we have CAP_SYS_NICE we don't need this */
                 { .id = RLIMIT_RTTIME,   .name = "RLIMIT_RTTIME",   .value =  0 }
+#endif
         };
 
         unsigned u;
         int r;
 
+#ifdef __linux__
         assert(table[7].id == RLIMIT_RTTIME);
         table[7].value = rttime_usec_max; /* Do as I say AND do as I do */
+#endif
 
         if (!do_limit_resources)
                 return 0;
@@ -1922,7 +2016,7 @@ static void show_help(const char *exe) {
 
         static const char * const sp_names[] =  {
                 [SCHED_OTHER] = "OTHER",
-                [SCHED_BATCH] = "BATCH",
+                // [SCHED_BATCH] = "BATCH",
                 [SCHED_FIFO] = "FIFO",
                 [SCHED_RR] = "RR"
         };
@@ -2287,11 +2381,27 @@ int main(int argc, char *argv[]) {
                 LOG_NDELAY|LOG_PID|(log_stderr ? LOG_PERROR : 0),
                 LOG_DAEMON);
 
+#ifdef __FreeBSD__
+        cap_channel_t *capcasper = cap_init();
+        if (capcasper == NULL) {
+                fprintf(stderr, "Failed to initialize libcasper\n");
+                goto finish;
+        }
+        capsysctl = cap_service_open(capcasper, "system.sysctl");
+        if (capsysctl == NULL) {
+                fprintf(stderr, "Failed to initialize libcasper sysctl service\n");
+                goto finish;
+        }
+        cap_close(capcasper);
+#endif
+
+#ifdef __linux__
         /* Raise our timer slack, we don't really need to be woken up
          * on time. */
         slack_ns = (((unsigned long) canary_watchdog_msec - (unsigned long) canary_cheep_msec) / 2UL) * 1000000UL;
         if (prctl(PR_SET_TIMERSLACK, slack_ns) < 0)
                 syslog(LOG_WARNING, "PRT_SET_TIMERSLACK failed: %s\n", strerror(errno));
+#endif
 
         self_drop_realtime(our_nice_level);
 

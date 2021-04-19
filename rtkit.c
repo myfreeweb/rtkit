@@ -29,7 +29,7 @@
 
 #include "rtkit.h"
 
-#ifdef __linux__
+#if defined(__linux__) || defined(__FreeBSD__)
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -39,9 +39,18 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/syscall.h>
+#if defined(__FreeBSD__)
+#include <sys/thr.h>
+#endif
 
 static pid_t _gettid(void) {
+#if defined(__linux__)
         return (pid_t) syscall(SYS_gettid);
+#elif defined(__FreeBSD__)
+        long tid = -1;
+        thr_self(&tid);
+        return (pid_t) tid;
+#endif
 }
 
 static int translate_error(const char *name) {
